@@ -120,3 +120,88 @@ docker compose up -d
 - **Соответствие best practices**: health checks, restart policies, proper networking
 
 ---
+
+## Задание 3. Реализация репликации MongoDB
+
+### Цель
+Создать высокодоступную реализацию шардированного кластера MongoDB с полной репликацией для обеспечения отказоустойчивости и автоматического восстановления при сбоях.
+
+### Выполненная работа
+
+#### Проект `mongo-sharding-repl`
+**Решаемая проблема**: Переход от базового шардирования к enterprise-ready архитектуре с полной репликацией
+
+**Архитектурные компоненты**:
+- **3x Config Server RS** (`configSrv-1,2,3`) - Replica Set для метаданных кластера (порты 27017, 27027, 27037)
+- **3x Shard1 RS** (`shard1-1,2,3`) - Replica Set для первого шарда (порты 27018, 27028, 27038)  
+- **3x Shard2 RS** (`shard2-1,2,3`) - Replica Set для второго шарда (порты 27019, 27029, 27039)
+- **1x mongos Router** (`mongos_router`) - маршрутизация к Replica Sets (порт 27020)
+- **1x FastAPI App** (`pymongo_api`) - веб-приложение (порт 8080)
+- **1x Init Container** (`mongo-init`) - автоматическая инициализация всех Replica Sets
+
+#### Ключевые технические решения
+
+**Полная репликация**:
+- Каждый компонент (Config Servers, Shard1, Shard2) реализован как 3-узловый Replica Set
+- 1 Primary + 2 Secondary узла в каждом RS обеспечивают отказоустойчивость
+- Автоматическое переключение Primary при сбоях (failover)
+
+**Соответствие enterprise workflow**:
+```bash
+# Запуск кластера с 9 MongoDB узлами одной командой
+docker compose up -d
+
+# Заполнение данными с проверкой репликации
+./scripts/mongo-init.sh
+```
+
+**Конфигурация высокой доступности**:
+- Sharding key: `hashed(name)` для равномерного распределения
+- Коллекция: `somedb.helloDoc` 
+- Тестовые данные: 1000 документов реплицированы на все узлы
+- Выдерживает отказ любого 1 узла из 3 в каждом RS
+
+#### Архитектурные улучшения
+
+**Enterprise-ready конфигурация**:
+- 9 MongoDB контейнеров с индивидуальными health checks
+- Restart policies (`unless-stopped`) для всех сервисов
+- Isolated network с персистентными томами для каждого узла
+- Правильные timeout и retry настройки для enterprise нагрузок
+
+**Последовательность запуска**:
+1. Все MongoDB узлы (9 контейнеров) → healthy
+2. Init-контейнер инициализирует все 3 Replica Sets → completed successfully  
+3. mongos Router подключается ко всем Config Servers → healthy
+4. FastAPI приложение подключается к mongos → ready
+
+#### Результаты тестирования
+
+**Успешное распределение и репликация данных**:
+- Общее количество документов: 1000
+- Shard 1: 492 документа (Primary + Secondary узлы)
+- Shard 2: 508 документов (Primary + Secondary узлы)
+- Данные идентичны на Primary и Secondary узлах каждого RS
+
+**Статус Replica Sets**:
+- Config Server RS: configSrv-1 (PRIMARY) + configSrv-2,3 (SECONDARY)
+- Shard1 RS: shard1-1 (PRIMARY) + shard1-2,3 (SECONDARY)
+- Shard2 RS: shard2-1 (PRIMARY) + shard2-2,3 (SECONDARY)
+
+**API функциональность**:
+- `GET /` - показывает topology: "Sharded" с корректными Replica Sets
+- `GET /helloDoc/count` - агрегация через mongos из всех шардов  
+- `GET /helloDoc/users` - данные из всех реплик работают корректно
+- Чтение с Secondary узлов для балансировки нагрузки
+
+### Результат
+
+Создан enterprise-ready высокодоступный шардированный кластер MongoDB:
+- **Полная отказоустойчивость**: выдерживает отказ любого узла
+- **Автоматическое восстановление**: failover и Primary election
+- **Простота развертывания**: стандартные команды `docker compose up -d`
+- **Автоматическая инициализация**: без manual setup steps для 9 узлов  
+- **Горизонтальная масштабируемость + HA**: готовность к production нагрузкам
+- **Соответствие enterprise practices**: health checks, restart policies, proper networking, persistence
+
+---
