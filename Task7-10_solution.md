@@ -378,3 +378,194 @@ sh.shardCollection("mobilnymir.inventory", {
 - Унифицированный owner_key решает проблему гостевых корзин
 
 ---
+
+# Задание 8. Выявление и устранение «горячих» шардов
+
+## Проблема
+Категория "Электроника" создала перегрузку одного из шардов MongoDB - 70% запросов приходится на эти товары. Необходимо разработать стратегию мониторинга и устранения горячих шардов.
+
+## 1. Метрики для отслеживания состояния шардов
+
+### 1.1 Базовые метрики распределения данных
+
+```javascript
+// Проверка распределения документов по шардам
+db.products.getShardDistribution()
+
+// Пример вывода:
+// Shard shard01 at shard01/localhost:27018
+//  data : 2.5GB docs : 150000 chunks : 45
+// Shard shard02 at shard02/localhost:27019  
+//  data : 8.2GB docs : 520000 chunks : 156  // ⚠️ Горячий шард!
+// Shard shard03 at shard03/localhost:27020
+//  data : 2.1GB docs : 130000 chunks : 39
+```
+
+### 1.2 Метрики нагрузки на шарды
+
+```javascript
+// Статистика операций по шардам
+db.adminCommand({ 
+  shardConnPoolStats: 1 
+})
+
+// Мониторинг количества запросов
+db.runCommand({ 
+  collStats: "products", 
+  indexDetails: true 
+})
+```
+
+### 1.3 Скрипт для регулярного мониторинга
+
+```javascript
+// Скрипт для выявления дисбаланса
+function checkShardBalance() {
+  const stats = db.products.getShardDistribution();
+  const shards = [];
+  
+  // Парсинг статистики (псевдокод)
+  stats.forEach(shard => {
+    shards.push({
+      name: shard.name,
+      docs: shard.documentCount,
+      size: shard.dataSize
+    });
+  });
+  
+  // Вычисление среднего
+  const avgDocs = shards.reduce((sum, s) => sum + s.docs, 0) / shards.length;
+  
+  // Проверка отклонения
+  shards.forEach(shard => {
+    const deviation = Math.abs(shard.docs - avgDocs) / avgDocs * 100;
+    if (deviation > 30) {
+      print(`WARNING: Shard ${shard.name} has ${deviation}% deviation!`);
+    }
+  });
+}
+```
+
+## 2. Механизмы устранения дисбаланса
+
+### 2.1 Перенастройка балансировщика
+
+```javascript
+// Включение балансировщика
+sh.setBalancerState(true)
+
+// Настройка окна балансировки (ночные часы)
+db.settings.update(
+   { _id: "balancer" },
+   { $set: { activeWindow : { start : "23:00", stop : "06:00" } } },
+   { upsert: true }
+)
+
+// Уменьшение размера чанков для лучшего распределения
+use config
+db.settings.save({
+  _id: "chunksize",
+  value: 32  // МБ вместо стандартных 64
+})
+```
+
+### 2.2 Ручное перераспределение данных
+
+```javascript
+// Для категории "electronics" - разделение на подкатегории
+// Добавляем поле subcategory для более детального разделения
+db.products.updateMany(
+  { category: "electronics" },
+  { $set: { 
+    subcategory: { 
+      $switch: {
+        branches: [
+          { case: { $regex: /phone|smartphone/i }, then: "smartphones" },
+          { case: { $regex: /laptop|notebook/i }, then: "laptops" },
+          { case: { $regex: /tv|television/i }, then: "tvs" }
+        ],
+        default: "other_electronics"
+      }
+    }
+  }}
+)
+
+// Миграция на новый составной ключ
+sh.shardCollection("mobilnymir.products_v2", {
+  category: 1,
+  subcategory: 1,
+  _id: "hashed"
+})
+```
+
+### 2.3 Настройка chunk migration
+
+```javascript
+// Принудительное разделение больших чанков
+sh.splitFind("mobilnymir.products", { category: "electronics" })
+
+// Перемещение чанков вручную
+sh.moveChunk("mobilnymir.products", 
+  { category: "electronics", _id: MinKey },
+  "shard03"  // Менее загруженный шард
+)
+```
+
+## 3. Превентивные меры
+
+### 3.1 Алерты для раннего обнаружения
+
+```javascript
+// Настройка порогов для мониторинга
+const thresholds = {
+  maxDeviationPercent: 30,    // Максимальное отклонение от среднего
+  maxChunksPerShard: 200,      // Максимум чанков на шард
+  maxSizeGBPerShard: 10        // Максимальный размер данных
+};
+
+// Функция проверки (запускать по cron)
+function checkShardHealth() {
+  const dist = db.products.getShardDistribution();
+  // Логика проверки порогов
+  // Отправка алертов при превышении
+}
+```
+
+### 3.2 Оптимизация для популярных категорий
+
+```javascript
+// Создание отдельной коллекции для горячих данных
+db.createCollection("hot_products");
+
+// Вынос популярных товаров
+db.products.find({ 
+  category: "electronics", 
+  views: { $gt: 10000 } 
+}).forEach(doc => {
+  db.hot_products.insert(doc);
+});
+
+// Шардирование с учетом популярности
+sh.shardCollection("mobilnymir.hot_products", {
+  popularity_score: 1,
+  _id: "hashed"
+});
+```
+
+## 4. Рекомендации по настройке
+
+1. **Регулярный мониторинг**: Запускать проверку баланса каждые 4 часа
+2. **Автоматическая балансировка**: Включить в ночные часы для минимизации влияния на производительность
+3. **Размер чанков**: Уменьшить до 32MB для лучшей гранулярности
+4. **Превентивное разделение**: Для категорий с ростом > 20% в месяц
+
+## Заключение по заданию 8
+
+Предложенная система мониторинга и балансировки позволит:
+- Своевременно выявлять горячие шарды через метрики отклонения
+- Автоматически перераспределять нагрузку через балансировщик
+- Предотвращать будущие проблемы через превентивные меры
+
+Ключевое решение для "Электроники" - введение subcategory в шард-ключ для более детального распределения популярной категории.
+
+---
