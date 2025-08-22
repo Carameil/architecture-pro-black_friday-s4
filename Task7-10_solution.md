@@ -669,3 +669,272 @@ sh.shardCollection("mobilnymir.hot_products", {
 Ключевой принцип: финансовые и инвентарные операции всегда с primary, аналитика и архивы - с secondary.
 
 ---
+
+# Задание 10. Миграция на Cassandra: модель данных, стратегии репликации и шардирования
+
+## Контекст проблемы
+Во время Black Friday MongoDB с Range-Based Sharding показала критические проблемы:
+- При 50,000 RPS добавление новых шардов вызывало полное перераспределение данных
+- Просадка latency из-за ресурсов на миграцию чанков
+- Необходимость в leaderless архитектуре для устойчивости
+
+## Задание 10.1. Анализ данных для миграции в Cassandra
+
+### Критически важные данные и их характеристики
+
+| Сущность | Объем записей | Частота записи | Частота чтения | Критичность |
+|----------|---------------|----------------|----------------|-------------|
+| **Пользовательские сессии** | 10M активных | Очень высокая | Очень высокая | Высокая |
+| **Корзины (активные)** | 2-3M | Высокая | Высокая | Высокая |
+| **История просмотров** | 100M+/день | Очень высокая | Средняя | Средняя |
+| **Заказы** | 1M/день | Средняя | Средняя | Высокая |
+| **Товары** | 500K | Низкая | Очень высокая | Средняя |
+| **Остатки товаров** | 500K×5 зон | Высокая | Высокая | Критическая |
+
+### Рекомендации по миграции
+
+#### ✅ ПЕРЕНОСИМ в Cassandra:
+
+**1. Пользовательские сессии**
+- Причины: Write-heavy, TTL native support, key-value паттерн
+- Выгода: Линейное масштабирование записи
+
+**2. История просмотров / Клики**
+- Причины: Time-series данные, append-only, partitioning по времени
+- Выгода: Эффективная ротация старых данных
+
+**3. Корзины (активные)**
+- Причины: Высокая нагрузка на запись/чтение, TTL для очистки
+- Выгода: Быстрый доступ по ключу
+
+**4. Кеш популярных товаров**
+- Причины: Read-heavy, можно денормализовать
+- Выгода: Low latency чтения
+
+#### ❌ ОСТАВЛЯЕМ в MongoDB:
+
+**1. Заказы**
+- Причины: Нужны сложные запросы, транзакции, связи
+- Риски в Cassandra: Нет JOIN, сложная аналитика
+
+**2. Основной каталог товаров**
+- Причины: Нужен полнотекстовый поиск, фильтры по множеству полей
+- Риски в Cassandra: Только запросы по primary key
+
+**3. Остатки товаров**
+- Причины: Требуются атомарные операции декремента
+- Риски в Cassandra: Eventual consistency может привести к overselling
+
+## Задание 10.2. Модель данных для Cassandra
+
+### 1. Таблица user_sessions
+
+```sql
+CREATE TABLE user_sessions (
+    session_id UUID,
+    user_id TEXT,
+    created_at TIMESTAMP,
+    last_activity TIMESTAMP,
+    ip_address INET,
+    user_agent TEXT,
+    data MAP<TEXT, TEXT>,
+    PRIMARY KEY (session_id)
+) WITH default_time_to_live = 86400  -- 24 часа
+  AND gc_grace_seconds = 3600;
+
+-- Дополнительная таблица для поиска по user_id
+CREATE TABLE sessions_by_user (
+    user_id TEXT,
+    created_at TIMESTAMP,
+    session_id UUID,
+    PRIMARY KEY (user_id, created_at)
+) WITH CLUSTERING ORDER BY (created_at DESC)
+  AND default_time_to_live = 86400;
+```
+
+**Обоснование:**
+- Partition key `session_id` - равномерное распределение (UUID)
+- TTL автоматически удаляет старые сессии
+- Вторая таблица для запросов "все сессии пользователя"
+
+### 2. Таблица view_history
+
+```sql
+CREATE TABLE view_history (
+    user_id TEXT,
+    view_date DATE,
+    viewed_at TIMESTAMP,
+    product_id TEXT,
+    category TEXT,
+    price DECIMAL,
+    PRIMARY KEY ((user_id, view_date), viewed_at, product_id)
+) WITH CLUSTERING ORDER BY (viewed_at DESC, product_id ASC)
+  AND default_time_to_live = 2592000  -- 30 дней
+  AND compaction = {
+    'class': 'TimeWindowCompactionStrategy',
+    'compaction_window_unit': 'DAYS',
+    'compaction_window_size': '1'
+  };
+```
+
+**Обоснование:**
+- Composite partition key `(user_id, view_date)` - ограничивает размер партиции одним днем
+- Clustering по времени - эффективные запросы последних просмотров
+- TWCS для эффективного удаления старых данных
+
+### 3. Таблица carts
+
+```sql
+CREATE TABLE carts (
+    owner_key TEXT,  -- "u:user_id" или "s:session_id"
+    updated_at TIMESTAMP,
+    status TEXT,
+    items LIST<FROZEN<cart_item>>,
+    total DECIMAL,
+    PRIMARY KEY (owner_key)
+) WITH default_time_to_live = 604800;  -- 7 дней
+
+-- UDT для элементов корзины
+CREATE TYPE cart_item (
+    product_id TEXT,
+    quantity INT,
+    price DECIMAL,
+    name TEXT
+);
+
+-- Таблица для поиска брошенных корзин
+CREATE TABLE abandoned_carts (
+    abandonment_date DATE,
+    abandoned_at TIMESTAMP,
+    owner_key TEXT,
+    total DECIMAL,
+    PRIMARY KEY (abandonment_date, abandoned_at, owner_key)
+) WITH CLUSTERING ORDER BY (abandoned_at DESC);
+```
+
+**Обоснование:**
+- Simple partition key для быстрого доступа
+- LIST для хранения товаров
+- Отдельная таблица для аналитики брошенных корзин
+
+### 4. Таблица popular_products_cache
+
+```sql
+CREATE TABLE popular_products_cache (
+    category TEXT,
+    popularity_rank INT,
+    product_id TEXT,
+    name TEXT,
+    price DECIMAL,
+    image_url TEXT,
+    rating FLOAT,
+    stock_status TEXT,
+    PRIMARY KEY (category, popularity_rank, product_id)
+) WITH CLUSTERING ORDER BY (popularity_rank ASC)
+  AND default_time_to_live = 3600;  -- 1 час
+
+-- Глобальный топ
+CREATE TABLE global_popular_products (
+    shard INT,  -- 0-9 для распределения нагрузки
+    popularity_rank INT,
+    product_id TEXT,
+    data FROZEN<product_data>,
+    PRIMARY KEY (shard, popularity_rank)
+) WITH CLUSTERING ORDER BY (popularity_rank ASC);
+```
+
+**Обоснование:**
+- Партиционирование по категории для целевых запросов
+- Ранжирование через clustering key
+- Шардирование глобального топа для избежания hot partition
+
+## Задание 10.3. Стратегии обеспечения целостности данных
+
+### Обзор стратегий Cassandra
+
+| Стратегия | Описание | Когда срабатывает | Overhead |
+|-----------|----------|-------------------|----------|
+| **Hinted Handoff** | Временное хранение данных для недоступных узлов | При записи | Низкий |
+| **Read Repair** | Синхронизация при обнаружении расхождений | При чтении | Средний |
+| **Anti-Entropy Repair** | Полная проверка и восстановление | По расписанию | Высокий |
+
+### Рекомендации по сущностям
+
+#### 1. User Sessions
+- **Write CL**: `ONE` (максимальная скорость)
+- **Read CL**: `ONE` (не критично если потеряем)
+- **Стратегии**: Только Hinted Handoff
+- **Обоснование**: Сессии можно пересоздать, скорость важнее
+
+#### 2. View History
+- **Write CL**: `ANY` (fire-and-forget)
+- **Read CL**: `ONE`
+- **Стратегии**: Hinted Handoff + редкий Anti-Entropy (раз в неделю)
+- **Обоснование**: Потеря части истории некритична
+
+#### 3. Carts (Корзины)
+- **Write CL**: `QUORUM` (важна консистентность)
+- **Read CL**: `QUORUM`
+- **Стратегии**: Все три (Hinted Handoff + Read Repair + Anti-Entropy daily)
+- **Обоснование**: Критично для UX и конверсии
+
+#### 4. Popular Products Cache
+- **Write CL**: `ONE`
+- **Read CL**: `ONE` 
+- **Стратегии**: Только Hinted Handoff
+- **Обоснование**: Кеш можно пересчитать
+
+### Конфигурация repair стратегий
+
+```yaml
+# cassandra.yaml
+hinted_handoff_enabled: true
+max_hint_window_in_ms: 10800000  # 3 часа
+
+# Read repair chances
+read_repair_chance: 0.0  # Отключаем для сессий и кеша
+dclocal_read_repair_chance: 0.1  # 10% для корзин
+
+# Anti-entropy repair schedule (via cron)
+# Корзины - ежедневно
+0 2 * * * nodetool repair -pr keyspace carts
+# История - еженедельно  
+0 3 * * 0 nodetool repair -pr keyspace view_history
+```
+
+## Архитектурная схема миграции
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    API Gateway                             │
+└─────────────────┬─────────────────────┬────────────────────┘
+                  │                     │
+         ┌────────▼────────┐   ┌────────▼────────┐
+         │   MongoDB       │   │   Cassandra     │
+         │   Cluster       │   │   Cluster       │
+         ├─────────────────┤   ├─────────────────┤
+         │ • Orders        │   │ • Sessions      │
+         │ • Products      │   │ • View History  │
+         │ • Inventory     │   │ • Carts         │
+         │                 │   │ • Popular Cache │
+         └─────────────────┘   └─────────────────┘
+         Strong Consistency    Eventual Consistency
+         Complex Queries       High Write Throughput
+```
+
+## Заключение по заданию 10
+
+Предложенная гибридная архитектура MongoDB + Cassandra позволит:
+
+1. **Снизить нагрузку на MongoDB** - вынос 70% write операций в Cassandra
+2. **Линейное масштабирование** - добавление узлов Cassandra без downtime
+3. **Оптимальное использование БД** - каждая для своих задач
+4. **Готовность к 100K+ RPS**
+
+Ключевые решения:
+- Сессии и история в Cassandra (write-heavy, TTL)
+- Заказы и каталог в MongoDB (сложные запросы)
+- Разные consistency levels для разных данных
+- Минимальный repair overhead для некритичных данных
+
+---
