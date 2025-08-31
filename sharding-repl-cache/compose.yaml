@@ -1,0 +1,539 @@
+name: sharding-repl-cache
+
+services:
+  # Init контейнер для инициализации всех Replica Sets
+  mongo-init:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: mongo-init
+    networks:
+      - app-network
+    depends_on:
+      configSrv-1:
+        condition: service_healthy
+      configSrv-2:
+        condition: service_healthy
+      configSrv-3:
+        condition: service_healthy
+      shard1-1:
+        condition: service_healthy
+      shard1-2:
+        condition: service_healthy
+      shard1-3:
+        condition: service_healthy
+      shard2-1:
+        condition: service_healthy
+      shard2-2:
+        condition: service_healthy
+      shard2-3:
+        condition: service_healthy
+    command: >
+      bash -c "
+        echo 'Инициализация Config Server RS...'
+        mongosh --host configSrv-1:27017 --quiet --eval '
+          rs.initiate({
+            _id: \"config_server\",
+            configsvr: true,
+            members: [
+              { _id: 0, host: \"configSrv-1:27017\" },
+              { _id: 1, host: \"configSrv-2:27017\" },
+              { _id: 2, host: \"configSrv-3:27017\" }
+            ]
+          });
+        '
+        
+        echo 'Инициализация Shard1 RS...'
+        mongosh --host shard1-1:27018 --quiet --eval '
+          rs.initiate({
+            _id: \"shard1\",
+            members: [
+              { _id: 0, host: \"shard1-1:27018\" },
+              { _id: 1, host: \"shard1-2:27018\" },
+              { _id: 2, host: \"shard1-3:27018\" }
+            ]
+          });
+        '
+        
+        echo 'Инициализация Shard2 RS...'
+        mongosh --host shard2-1:27019 --quiet --eval '
+          rs.initiate({
+            _id: \"shard2\",
+            members: [
+              { _id: 0, host: \"shard2-1:27019\" },
+              { _id: 1, host: \"shard2-2:27019\" },
+              { _id: 2, host: \"shard2-3:27019\" }
+            ]
+          });
+        '
+        
+        echo 'Ожидание готовности всех RS...'
+        sleep 45
+        
+        echo 'Инициализация завершена!'
+      "
+    restart: "no"
+
+  # Config Server Replica Set
+  configSrv-1:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: configSrv-1
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.10
+    volumes:
+      - config1-data:/data/db
+    command:
+      [
+        "--configsvr",
+        "--replSet",
+        "config_server",
+        "--bind_ip_all",
+        "--port",
+        "27017"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  configSrv-2:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: configSrv-2
+    restart: unless-stopped
+    ports:
+      - "27027:27017"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.11
+    volumes:
+      - config2-data:/data/db
+    command:
+      [
+        "--configsvr",
+        "--replSet",
+        "config_server",
+        "--bind_ip_all",
+        "--port",
+        "27017"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  configSrv-3:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: configSrv-3
+    restart: unless-stopped
+    ports:
+      - "27037:27017"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.12
+    volumes:
+      - config3-data:/data/db
+    command:
+      [
+        "--configsvr",
+        "--replSet",
+        "config_server",
+        "--bind_ip_all",
+        "--port",
+        "27017"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  # Shard 1 Replica Set
+  shard1-1:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: shard1-1
+    restart: unless-stopped
+    ports:
+      - "27018:27018"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.20
+    volumes:
+      - shard1-1-data:/data/db
+    command:
+      [
+        "--shardsvr",
+        "--replSet",
+        "shard1",
+        "--bind_ip_all",
+        "--port",
+        "27018"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27018", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  shard1-2:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: shard1-2
+    restart: unless-stopped
+    ports:
+      - "27028:27018"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.21
+    volumes:
+      - shard1-2-data:/data/db
+    command:
+      [
+        "--shardsvr",
+        "--replSet",
+        "shard1",
+        "--bind_ip_all",
+        "--port",
+        "27018"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27018", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  shard1-3:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: shard1-3
+    restart: unless-stopped
+    ports:
+      - "27038:27018"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.22
+    volumes:
+      - shard1-3-data:/data/db
+    command:
+      [
+        "--shardsvr",
+        "--replSet",
+        "shard1",
+        "--bind_ip_all",
+        "--port",
+        "27018"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27018", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  # Shard 2 Replica Set
+  shard2-1:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: shard2-1
+    restart: unless-stopped
+    ports:
+      - "27019:27019"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.30
+    volumes:
+      - shard2-1-data:/data/db
+    command:
+      [
+        "--shardsvr",
+        "--replSet",
+        "shard2",
+        "--bind_ip_all",
+        "--port",
+        "27019"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27019", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  shard2-2:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: shard2-2
+    restart: unless-stopped
+    ports:
+      - "27029:27019"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.31
+    volumes:
+      - shard2-2-data:/data/db
+    command:
+      [
+        "--shardsvr",
+        "--replSet",
+        "shard2",
+        "--bind_ip_all",
+        "--port",
+        "27019"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27019", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  shard2-3:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: shard2-3
+    restart: unless-stopped
+    ports:
+      - "27039:27019"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.32
+    volumes:
+      - shard2-3-data:/data/db
+    command:
+      [
+        "--shardsvr",
+        "--replSet",
+        "shard2",
+        "--bind_ip_all",
+        "--port",
+        "27019"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27019", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  # Redis Cluster (6 nodes: 3 masters + 3 slaves)
+  redis-1:
+    image: dh-mirror.gitverse.ru/redis:latest
+    container_name: redis-1
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.40
+    volumes:
+      - redis-1-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  redis-2:
+    image: dh-mirror.gitverse.ru/redis:latest
+    container_name: redis-2
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.41
+    volumes:
+      - redis-2-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  redis-3:
+    image: dh-mirror.gitverse.ru/redis:latest
+    container_name: redis-3
+    restart: unless-stopped
+    ports:
+      - "6381:6379"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.42
+    volumes:
+      - redis-3-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  redis-4:
+    image: dh-mirror.gitverse.ru/redis:latest
+    container_name: redis-4
+    restart: unless-stopped
+    ports:
+      - "6382:6379"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.43
+    volumes:
+      - redis-4-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  redis-5:
+    image: dh-mirror.gitverse.ru/redis:latest
+    container_name: redis-5
+    restart: unless-stopped
+    ports:
+      - "6383:6379"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.44
+    volumes:
+      - redis-5-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  redis-6:
+    image: dh-mirror.gitverse.ru/redis:latest
+    container_name: redis-6
+    restart: unless-stopped
+    ports:
+      - "6384:6379"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.45
+    volumes:
+      - redis-6-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  # Отдельный Redis для кеширования приложения (standalone)
+  redis-cache:
+    image: dh-mirror.gitverse.ru/redis:latest
+    container_name: redis-cache
+    restart: unless-stopped
+    ports:
+      - "6385:6379"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.50
+    volumes:
+      - redis-cache-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      start_period: 30s
+      timeout: 5s
+      retries: 3
+
+  # Роутер mongos
+  mongos_router:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: mongos_router
+    restart: unless-stopped
+    ports:
+      - "27020:27020"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.7
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+    command:
+      [
+        "mongos",
+        "--configdb",
+        "config_server/configSrv-1:27017,configSrv-2:27017,configSrv-3:27017",
+        "--bind_ip_all",
+        "--port",
+        "27020"
+      ]
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27020", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      start_period: 60s
+      timeout: 10s
+      retries: 10
+
+  # Приложение pymongo-api
+  pymongo_api:
+    container_name: pymongo_api
+    image: kazhem/pymongo_api:1.0.0
+    restart: unless-stopped
+    depends_on:
+      mongos_router:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    networks:
+      app-network:
+        ipv4_address: 173.17.0.6
+    environment:
+      MONGODB_URL: "mongodb://mongos_router:27020"
+      MONGODB_DATABASE_NAME: "somedb"
+      REDIS_URL: "redis://redis-cache:6379"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      start_period: 60s
+      timeout: 10s
+      retries: 3
+
+networks:
+  app-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 173.17.0.0/16
+
+volumes:
+  config1-data:
+  config2-data:
+  config3-data:
+  shard1-1-data:
+  shard1-2-data:
+  shard1-3-data:
+  shard2-1-data:
+  shard2-2-data:
+  shard2-3-data:
+  redis-1-data:
+  redis-2-data:
+  redis-3-data:
+  redis-4-data:
+  redis-5-data:
+  redis-6-data:
+  redis-cache-data:

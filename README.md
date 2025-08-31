@@ -1,5 +1,9 @@
 # pymongo-api
 
+## Запуск sharding-repl-cache
+
+Инструкция по запуска представлена в README.md файле в директории подпроекта: [`README.md`](sharding-repl-cache/README.md)
+
 ## Как запустить
 
 Запускаем mongodb и приложение
